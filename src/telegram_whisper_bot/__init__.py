@@ -1,4 +1,4 @@
-"""Telegram bot that answers a voice note or audio file with its Whisper transcript."""
+"""Telegram bot that answers a voice note or audio file with its transcript."""
 
 import asyncio
 import base64
@@ -47,7 +47,7 @@ def transcribable(allowed_ids: list[int]) -> filters.BaseFilter:
 
 
 async def to_mp3(audio: bytes) -> bytes:
-    # One known format for every input (OGG/Opus, m4a, wav...); Whisper resamples to 16 kHz mono anyway.
+    # One known format for every input (OGG/Opus, m4a, wav...); speech models resample to 16 kHz mono anyway.
     # Temp files, not pipes: an m4a with its index at the end needs a seekable input.
     with tempfile.TemporaryDirectory() as tmp:
         src, dst = Path(tmp, "in"), Path(tmp, "out.mp3")

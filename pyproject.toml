@@ -1,7 +1,7 @@
 [project]
 name = "telegram-whisper-bot"
 version = "0.1.0"
-description = "Personal Telegram bot that replies to voice notes with a Whisper transcript"
+description = "Personal Telegram bot that replies to voice notes with a transcript"
 authors = [
     { name = "Esi-Abolfazl", email = "Abolfazl.K@proton.me" }
 ]

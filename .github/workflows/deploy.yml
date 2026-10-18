@@ -47,7 +47,7 @@ jobs:
       - name: ffmpeg must carry libmp3lame, or every transcription fails in prod only
         run: |
           docker run --rm telegram-whisper-bot:check ffmpeg -hide_banner -encoders | grep -q libmp3lame \
-            || { echo "::error::no libmp3lame: the bot cannot build the mp3 it sends to Whisper"; exit 1; }
+            || { echo "::error::no libmp3lame: the bot cannot build the mp3 it sends to the transcription model"; exit 1; }
 
       - uses: docker/build-push-action@v6
         with:

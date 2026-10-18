@@ -1,5 +1,5 @@
 FROM python:3.13-alpine
-# ffmpeg turns every input (OGG/Opus voice, m4a, wav...) into the mp3 sent to Whisper.
+# ffmpeg turns every input (OGG/Opus voice, m4a, wav...) into the mp3 sent to the transcription model.
 # First layer: slowest to fetch and least likely to change.
 RUN apk add --no-cache ffmpeg
 COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /bin/uv
