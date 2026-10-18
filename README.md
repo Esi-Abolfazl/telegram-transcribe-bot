@@ -1,8 +1,10 @@
 # telegram-transcribe-bot
 
-A self-hosted Telegram bot that turns voice into text. Send it a voice note, an audio file or a
-forwarded voice; it replies with the transcript. The language is auto-detected, Persian included.
-Transcripts longer than Telegram's 4096-character limit arrive as several messages.
+A self-hosted Telegram bot that turns speech into text. Send it a voice note, an audio file, a
+video or a round video, forwarded or not; it replies with the transcript. The language is auto-detected, Persian included.
+A "Transcribing…" note shows it arrived and disappears when the answer comes. The transcript
+breaks into lines where the speaker pauses, when the model returns word timings (scribe-v2,
+Whisper); past Telegram's 4096-character limit it arrives as several messages.
 
 - **Any model.** OpenRouter's 25+ transcription models (Whisper, ElevenLabs Scribe, GPT-4o
   Transcribe, Gemini...), any OpenAI-compatible API, or a local Whisper on your own machine.
@@ -149,7 +151,10 @@ running image was built from.
 
 ## Limits
 
-- The Bot API lets a bot download files up to 20 MB; bigger files get a short refusal.
+- The Bot API lets a bot download files up to 20 MB; bigger files get a short refusal. Videos hit
+  this first; send a long one as an audio file, or trim it.
+- Anything without sound (a photo, sticker, GIF, silent video, PDF or other file) gets a "no
+  sound" reply instead of a transcript.
 - Each file is one transcription request, and OpenRouter's providers time out after 60 s. A
   recording of tens of minutes may fail; splitting it with ffmpeg would lift that.
 - `/model` lists what the endpoint's `/models` returns. OpenRouter and local servers return

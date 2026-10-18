@@ -1,6 +1,7 @@
-"""Telegram bot that answers a voice note or audio file with its transcript."""
+"""Telegram bot that answers a voice note, audio file or video with its transcript."""
 
 import asyncio
+import contextlib
 import base64
 import html
 import logging
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import httpx
 from telegram import BotCommand, Update
-from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,8 +31,16 @@ DOWNLOAD_LIMIT = 20 * 1024 * 1024
 APIS = ("openrouter", "openai")
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "elevenlabs/scribe-v2"
+# Measured on scribe-v2 word timings (2026-10-18): sung line ends pause 0.3 to 0.42 s, speech
+# 0.36 to 1.6 s. MIN_LINE_WORDS keeps a breath mid-sentence from leaving a two-word line.
+LINE_PAUSE = 0.3
+PARAGRAPH_PAUSE = 2.0
+MIN_LINE_WORDS = 6
+SENTENCE_ENDS = (".", "?", "!", "؟")
+NO_SOUND = "This has no sound to transcribe. Send a voice note, audio or a video with sound."
 HELP = (
-    "Send me a voice note, an audio file or a forwarded voice and I reply with its transcript.\n\n"
+    "Send me a voice note, an audio file, a video or a round video, forwarded or not, and I reply with "
+    "its transcript. Telegram lets bots download up to 20 MB.\n\n"
     "/model shows the transcription model and the ones you can pick.\n"
     "/model <id> switches to another model.\n"
     "/model reset goes back to the model set in .env."
@@ -72,9 +81,12 @@ def parse_allowed_ids(raw: str) -> list[int]:
     return [int(part) for part in raw.replace(",", " ").split()]
 
 
-def transcribable(allowed_ids: list[int]) -> filters.BaseFilter:
-    """Voice notes, audio files and audio sent as a document, from allowed users only."""
-    media = filters.VOICE | filters.AUDIO | filters.Document.AUDIO
+def incoming_media(allowed_ids: list[int]) -> filters.BaseFilter:
+    """Every file or media message from allowed users: anything without sound still gets an answer."""
+    media = (
+        filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL
+        | filters.ANIMATION | filters.PHOTO | filters.Sticker.ALL
+    )
     return media & filters.User(user_id=allowed_ids)
 
 
@@ -114,43 +126,104 @@ def models_html(model: str, from_env: bool, available: list[str] | None) -> str:
     return "\n".join(rows)
 
 
+class NoAudio(Exception):
+    """Nothing to hear: a silent video, or a file that isn't media."""
+
+
+async def run(*cmd: str) -> str:
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed: {err.decode(errors='replace').strip()}")
+    return out.decode()
+
+
 async def to_mp3(audio: bytes) -> bytes:
     # One known format for every input (OGG/Opus, m4a, wav...); speech models resample to 16 kHz mono anyway.
     # Temp files, not pipes: an m4a with its index at the end needs a seekable input.
     with tempfile.TemporaryDirectory() as tmp:
         src, dst = Path(tmp, "in"), Path(tmp, "out.mp3")
         src.write_bytes(audio)
-        proc = await asyncio.create_subprocess_exec(
+        try:
+            streams = await run(
+                "ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(src)
+            )
+        except RuntimeError as exc:
+            raise NoAudio from exc  # not media at all: a PDF, a zip, a text file
+        if not streams.strip():
+            raise NoAudio
+        await run(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(src),
             "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(dst),
-            stderr=asyncio.subprocess.PIPE,
         )
-        _, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {err.decode(errors='replace').strip()}")
         return dst.read_bytes()
+
+
+def lay_out(result: dict) -> str:
+    """The transcript with a line per phrase, cut at pauses when the model returns word timings."""
+    words = [w for w in result.get("words") or [] if w.get("type") != "spacing" and "start" in w]
+    if not words:
+        segments = result.get("segments") or []
+        if len(segments) > 1:
+            return "\n".join(s["text"].strip() for s in segments)
+        return result.get("text", "").strip()
+    lines: list[str] = []
+    line: list[str] = []
+
+    def flush() -> None:
+        if line:
+            lines.append(" ".join(line))
+            line.clear()
+
+    prev_end = words[0]["start"]
+    for w in words:
+        gap = w["start"] - prev_end
+        prev_end = w["end"]
+        if gap >= PARAGRAPH_PAUSE:
+            flush()
+            lines.append("")
+        elif line and (gap >= LINE_PAUSE and len(line) >= MIN_LINE_WORDS or line[-1].endswith(SENTENCE_ENDS)):
+            flush()
+        if w.get("type") == "audio_event":
+            flush()
+            lines.append(w["word"].strip())
+        else:
+            line.append(w["word"].strip())
+    flush()
+    return "\n".join(lines).strip()
+
+
+async def request(client: httpx.AsyncClient, endpoint: Endpoint, model: str, mp3: bytes, timed: bool) -> httpx.Response:
+    url = f"{endpoint.base_url.rstrip('/')}/audio/transcriptions"
+    if endpoint.api == "openrouter":
+        # Only the JSON shape carries OpenRouter's data policy: skip providers that keep audio.
+        body = {
+            "model": model,
+            "input_audio": {"data": base64.b64encode(mp3).decode(), "format": "mp3"},
+            "provider": {"data_collection": "deny"},
+        }
+        if timed:
+            body |= {"response_format": "verbose_json", "timestamp_granularities": ["word"]}
+        return await client.post(url, json=body, headers=endpoint.headers())
+    data = {"model": model}
+    if timed:
+        data |= {"response_format": "verbose_json", "timestamp_granularities[]": "word"}
+    files = {"file": ("audio.mp3", mp3, "audio/mpeg")}
+    return await client.post(url, data=data, files=files, headers=endpoint.headers())
 
 
 async def transcribe(audio: bytes, endpoint: Endpoint, model: str) -> str:
     # shortcut: one request per file; OpenRouter's providers time out after 60 s, so a very long
     # recording (tens of minutes) can fail. Split it into chunks with ffmpeg if that ever happens.
     mp3 = await to_mp3(audio)
-    url = f"{endpoint.base_url.rstrip('/')}/audio/transcriptions"
     async with httpx.AsyncClient(timeout=300) as client:
-        if endpoint.api == "openrouter":
-            # Only the JSON shape carries OpenRouter's data policy: skip providers that keep audio.
-            body = {
-                "model": model,
-                "input_audio": {"data": base64.b64encode(mp3).decode(), "format": "mp3"},
-                "provider": {"data_collection": "deny"},
-            }
-            resp = await client.post(url, json=body, headers=endpoint.headers())
-        else:
-            files = {"file": ("audio.mp3", mp3, "audio/mpeg")}
-            resp = await client.post(url, data={"model": model}, files=files, headers=endpoint.headers())
+        resp = await request(client, endpoint, model, mp3, timed=True)
+        if resp.status_code == 400:
+            # Some models take only plain JSON, without word timings; ask once more without them.
+            resp = await request(client, endpoint, model, mp3, timed=False)
     if resp.status_code != 200:
         raise RuntimeError(f"{endpoint.api} {resp.status_code}: {resp.text[:500]}")
-    return resp.json()["text"]
+    return lay_out(resp.json())
 
 
 async def list_models(endpoint: Endpoint) -> list[str] | None:
@@ -170,22 +243,36 @@ async def list_models(endpoint: Endpoint) -> list[str] | None:
         return None
 
 
-async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoint: Endpoint, default_model: str) -> None:
+async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoint: Endpoint, default_model: str) -> None:
     msg = update.effective_message
-    media = msg.voice or msg.audio or msg.document
+    if msg.animation or msg.photo or msg.sticker:
+        await msg.reply_text(NO_SOUND)
+        return
+    media = msg.voice or msg.audio or msg.video or msg.video_note or msg.document
     if media.file_size and media.file_size > DOWNLOAD_LIMIT:
         await msg.reply_text("Telegram lets bots download files up to 20 MB only.")
         return
-    await msg.reply_chat_action(ChatAction.TYPING)
     model = current_model(context.bot_data, default_model)
+    # Tells the sender it arrived, so nobody sends the file twice; deleted once the answer is ready.
+    # Best effort: a network blip on this note must not cost the transcript.
+    working = None
+    with contextlib.suppress(TelegramError):
+        working = await msg.reply_text(f"Transcribing with {model}…")
     try:
         audio = bytes(await (await media.get_file()).download_as_bytearray())
         text = await transcribe(audio, endpoint, model)
+    except NoAudio:
+        await msg.reply_text(NO_SOUND)
+        return
     except Exception as exc:
         log.exception("transcription failed for message %s", msg.message_id)
         # Only allowed users get here, and the message carries no secret.
         await msg.reply_text(f"Transcription failed with {model}:\n{exc}"[:TELEGRAM_LIMIT])
         return
+    finally:
+        if working:
+            with contextlib.suppress(TelegramError):
+                await working.delete()
     chunks = split_message(text) or ["(no speech found)"]
     for chunk in chunks:
         await msg.reply_text(chunk)
@@ -272,9 +359,10 @@ def main() -> None:
     )
     is_allowed = filters.User(user_id=allowed)
     config = {"endpoint": endpoint, "default_model": default_model}
-    app.add_handler(MessageHandler(transcribable(allowed), partial(on_audio, **config)))
+    app.add_handler(MessageHandler(incoming_media(allowed), partial(on_media, **config)))
     app.add_handler(CommandHandler("model", partial(on_model, **config), filters=is_allowed))
     app.add_handler(CommandHandler(["start", "help"], on_help, filters=is_allowed))
     app.add_handler(MessageHandler(~is_allowed, on_stranger))
     log.info("polling; %s at %s; default model %s; %d allowed user(s)", api, endpoint.base_url, default_model, len(allowed))
-    app.run_polling()
+    # Keep retrying while Telegram is unreachable at startup (a flaky VPN or network) instead of exiting.
+    app.run_polling(bootstrap_retries=-1)
