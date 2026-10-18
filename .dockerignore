@@ -1,0 +1,7 @@
+.venv
+.env*
+.git
+.github
+.claude
+tests
+.DS_Store

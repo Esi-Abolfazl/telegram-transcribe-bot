@@ -1,0 +1,9 @@
+services:
+  bot:
+    image: ghcr.io/esi-abolfazl/telegram-whisper-bot:latest
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+  # no watchtower service: this host already runs traktak's (label-enable, host-wide)

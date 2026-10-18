@@ -1,0 +1,19 @@
+[project]
+name = "telegram-whisper-bot"
+version = "0.1.0"
+description = "Personal Telegram bot that replies to voice notes with a Whisper transcript"
+authors = [
+    { name = "Esi-Abolfazl", email = "Abolfazl.K@proton.me" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "python-telegram-bot>=22.8",
+]
+
+[project.scripts]
+telegram-whisper-bot = "telegram_whisper_bot:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
