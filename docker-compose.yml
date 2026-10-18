@@ -4,6 +4,24 @@ services:
     restart: unless-stopped
     init: true
     env_file: .env
+    volumes:
+      - ./data:/app/data
     labels:
+      # Auto-update when a watchtower runs with --label-enable on this host.
       - com.centurylinklabs.watchtower.enable=true
-  # no watchtower service: this host already runs traktak's (label-enable, host-wide)
+
+  # Optional local model: `docker compose --profile local up -d`, with
+  # TRANSCRIBE_API=openai and TRANSCRIBE_BASE_URL=http://whisper:9000/v1 in .env.
+  whisper:
+    profiles: [local]
+    image: hwdsl2/whisper-server
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: large-v3-turbo
+      # No auth: no port is published, so only the bot on this compose network reaches it.
+      WHISPER_API_KEY: ""
+    volumes:
+      - whisper-data:/var/lib/whisper
+
+volumes:
+  whisper-data:
