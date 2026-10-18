@@ -37,7 +37,7 @@ HELP = (
     "/model reset goes back to the model set in .env."
 )
 
-log = logging.getLogger("telegram_whisper_bot")
+log = logging.getLogger("telegram_transcribe_bot")
 
 
 @dataclass(frozen=True)

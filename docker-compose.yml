@@ -1,6 +1,6 @@
 services:
   bot:
-    image: ghcr.io/esi-abolfazl/telegram-whisper-bot:latest
+    image: ghcr.io/esi-abolfazl/telegram-transcribe-bot:latest
     restart: unless-stopped
     init: true
     env_file: .env

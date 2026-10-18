@@ -1,4 +1,4 @@
-# telegram-whisper-bot
+# telegram-transcribe-bot
 
 A self-hosted Telegram bot that turns voice into text. Send it a voice note, an audio file or a
 forwarded voice; it replies with the transcript. The language is auto-detected, Persian included.
@@ -23,15 +23,15 @@ You need Docker with Compose, a Telegram account, and an [OpenRouter key](https:
 3. Get the compose file and the env template into a new folder:
 
    ```bash
-   mkdir telegram-whisper-bot && cd telegram-whisper-bot
+   mkdir telegram-transcribe-bot && cd telegram-transcribe-bot
    ```
 
    ```bash
-   curl -fsSLO https://raw.githubusercontent.com/Esi-Abolfazl/telegram-whisper-bot/main/docker-compose.yml
+   curl -fsSLO https://raw.githubusercontent.com/Esi-Abolfazl/telegram-transcribe-bot/main/docker-compose.yml
    ```
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/Esi-Abolfazl/telegram-whisper-bot/main/.env.example -o .env
+   curl -fsSL https://raw.githubusercontent.com/Esi-Abolfazl/telegram-transcribe-bot/main/.env.example -o .env
    ```
 
 4. Open `.env` and fill in `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_IDS` and `TRANSCRIBE_API_KEY`.
@@ -130,7 +130,7 @@ cp .env.example .env
 Fill `.env`, then:
 
 ```bash
-uv run --env-file .env telegram-whisper-bot
+uv run --env-file .env telegram-transcribe-bot
 ```
 
 Tests (message splitting, the allow-list, the model choice):
@@ -142,7 +142,7 @@ uv run python -m unittest discover -s tests
 ## How it ships
 
 Every push to `main` runs the tests, builds a linux/amd64 image, checks that its ffmpeg can encode
-mp3, and pushes `ghcr.io/esi-abolfazl/telegram-whisper-bot:latest` plus a tag per commit. A
+mp3, and pushes `ghcr.io/esi-abolfazl/telegram-transcribe-bot:latest` plus a tag per commit. A
 watchtower started with `--label-enable` on your host picks up new images on its own, since the
 bot service carries its label. `docker compose exec bot printenv GIT_SHA` names the commit a
 running image was built from.

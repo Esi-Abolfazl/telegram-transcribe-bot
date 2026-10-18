@@ -11,4 +11,4 @@ COPY src ./src
 RUN uv sync --frozen --no-dev
 ARG GIT_SHA
 ENV GIT_SHA=${GIT_SHA}
-CMD ["uv", "run", "--frozen", "--no-sync", "telegram-whisper-bot"]
+CMD ["uv", "run", "--frozen", "--no-sync", "telegram-transcribe-bot"]

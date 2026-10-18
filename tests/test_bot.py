@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from telegram import Chat, Message, Update, User, Voice
 
-from telegram_whisper_bot import accepts_model, current_model, models_html, parse_allowed_ids, split_message, transcribable
+from telegram_transcribe_bot import accepts_model, current_model, models_html, parse_allowed_ids, split_message, transcribable
 
 
 def update_from(user_id: int, *, voice: bool = True) -> Update:

@@ -1,5 +1,5 @@
 [project]
-name = "telegram-whisper-bot"
+name = "telegram-transcribe-bot"
 version = "0.1.0"
 description = "Personal Telegram bot that replies to voice notes with a transcript"
 authors = [
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-telegram-whisper-bot = "telegram_whisper_bot:main"
+telegram-transcribe-bot = "telegram_transcribe_bot:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
