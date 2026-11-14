@@ -2,12 +2,14 @@
 
 A self-hosted Telegram bot that turns speech into text. Send it a voice note, an audio file, a
 video or a round video, forwarded or not; it replies with the transcript. The language is auto-detected, Persian included.
-A "Transcribing…" note shows it arrived and disappears when the answer comes. The transcript
+A "Transcribing…" note shows it arrived and turns into the transcript. The transcript
 breaks into lines where the speaker pauses, when the model returns word timings (scribe-v2,
 Whisper); past Telegram's 4096-character limit it arrives as several messages.
 
 - **Any model.** OpenRouter's 25+ transcription models (Whisper, ElevenLabs Scribe, GPT-4o
   Transcribe, Gemini...), any OpenAI-compatible API, or a local Whisper on your own machine.
+- **One reply per message, in order.** A forwarded batch of voices, photos and texts gets its
+  answers in the order you sent them, so the bot's block lines up with yours.
 - **Switch from Telegram.** `/model` lists the models your endpoint offers, `/model <id>` switches,
   `/model reset` goes back to the one in `.env`. The choice survives restarts.
 - **Manage access from Telegram.** Admins add and remove users with `/allow <id>` and `/deny <id>`,
@@ -172,8 +174,8 @@ running image was built from.
 - Anything without sound (a photo, sticker, GIF, silent video, PDF or other file) gets a "no
   sound" reply instead of a transcript.
 - An edited message is not transcribed again. Any other text you send gets the help.
-- Up to 4 files are transcribed at once, so answers can arrive out of order; each reply quotes
-  the message it answers.
+- Up to 4 files are transcribed at once; each reply quotes the message it answers.
+- Only the first 4096 characters of a transcript keep the batch order; the rest arrives as extra messages.
 - A `data/bot.pickle` that can't be read is moved to `bot.pickle.corrupt` at startup, and the bot
   starts on the `.env` model.
 - Each file is one transcription request, and OpenRouter's providers time out after 60 s. A

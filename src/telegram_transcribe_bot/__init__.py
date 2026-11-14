@@ -317,38 +317,56 @@ async def list_models(endpoint: Endpoint) -> list[str] | None:
     return model_ids(resp)
 
 
+# Updates run 4 at a time; each message's first reply waits its turn so replies keep the order sent.
+# shortcut: one lock per chat id is kept for the process lifetime; prune idle ones if an open bot sees very many chats.
+_first_reply_locks: dict[int, asyncio.Lock] = {}
+
+
+def first_reply(chat_id: int) -> asyncio.Lock:
+    return _first_reply_locks.setdefault(chat_id, asyncio.Lock())
+
+
+async def edit_or_reply(msg, working, text: str) -> None:
+    """Put `text` into the placeholder; send it as a quoted reply when there is none or the edit fails."""
+    if working:
+        try:
+            await working.edit_text(text)
+            return
+        except TelegramError:
+            pass
+    await msg.reply_text(text, do_quote=True)
+
+
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoint: Endpoint, default_model: str) -> None:
     msg = update.effective_message
-    if msg.animation or msg.photo or msg.sticker:
-        await msg.reply_text(NO_SOUND, do_quote=True)
-        return
-    media = msg.voice or msg.audio or msg.video or msg.video_note or msg.document
-    if media.file_size and media.file_size > DOWNLOAD_LIMIT:
-        await msg.reply_text("Telegram lets bots download files up to 20 MB only.", do_quote=True)
-        return
-    model = current_model(context.bot_data, default_model)
-    # Tells the sender it arrived, so nobody sends the file twice; deleted once the answer is ready.
-    # Best effort: a network blip on this note must not cost the transcript.
-    working = None
-    with contextlib.suppress(TelegramError):
-        working = await msg.reply_text(f"Transcribing with {model}…", do_quote=True)
+    async with first_reply(msg.chat_id):
+        if msg.animation or msg.photo or msg.sticker:
+            await msg.reply_text(NO_SOUND, do_quote=True)
+            return
+        media = msg.voice or msg.audio or msg.video or msg.video_note or msg.document
+        if media.file_size and media.file_size > DOWNLOAD_LIMIT:
+            await msg.reply_text("Telegram lets bots download files up to 20 MB only.", do_quote=True)
+            return
+        model = current_model(context.bot_data, default_model)
+        # Tells the sender it arrived, and becomes the transcript. Best effort: a network blip
+        # on this note must not cost the transcript (edit_or_reply falls back to a new message).
+        working = None
+        with contextlib.suppress(TelegramError):
+            working = await msg.reply_text(f"Transcribing with {model}…", do_quote=True)
     try:
         audio = bytes(await (await media.get_file()).download_as_bytearray())
         text = await transcribe(audio, endpoint, model)
     except NoAudio:
-        await msg.reply_text(NO_SOUND, do_quote=True)
+        await edit_or_reply(msg, working, NO_SOUND)
         return
     except Exception as exc:
         log.exception("transcription failed for message %s", msg.message_id)
         # Only allowed users get here, and the message carries no secret.
-        await msg.reply_text(f"Transcription failed with {model}:\n{exc}"[:TELEGRAM_LIMIT], do_quote=True)
+        await edit_or_reply(msg, working, f"Transcription failed with {model}:\n{exc}"[:TELEGRAM_LIMIT])
         return
-    finally:
-        if working:
-            with contextlib.suppress(TelegramError):
-                await working.delete()
     chunks = split_message(text) or ["(no speech found)"]
-    for chunk in chunks:
+    await edit_or_reply(msg, working, chunks[0])
+    for chunk in chunks[1:]:
         await msg.reply_text(chunk, do_quote=True)
     # Length only: transcripts stay out of the logs.
     log.info(
@@ -429,6 +447,12 @@ async def on_users(update: Update, context: ContextTypes.DEFAULT_TYPE, *, env_id
 
 async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(HELP)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    async with first_reply(msg.chat_id):
+        await msg.reply_text(HELP, do_quote=True)
 
 
 async def on_not_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,7 +548,7 @@ def main() -> None:
     app.add_handler(CommandHandler("users", partial(on_users, env_ids=allowed, admins=admins), filters=admin_only))
     app.add_handler(CommandHandler(["model", "allow", "deny", "users"], on_not_admin, filters=shared))
     app.add_handler(CommandHandler(["start", "help"], on_help, filters=shared))
-    app.add_handler(MessageHandler(incoming_text(shared), on_help))
+    app.add_handler(MessageHandler(incoming_text(shared), on_text))
     app.add_handler(MessageHandler(~shared, on_stranger))
     log.info(
         "polling; %s at %s; default model %s; %s allowed; %d admin(s)",

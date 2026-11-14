@@ -1,3 +1,4 @@
+import asyncio
 import json
 import pickle
 import tempfile
@@ -13,7 +14,7 @@ from telegram import Animation, Chat, PhotoSize, Sticker, Document, Message, Mes
 
 from telegram_transcribe_bot import ModelsUnavailable, NoAudio, accepts_model, model_ids, quarantine_corrupt_pickle, utf16_units, current_model, lay_out, models_html, parse_allowed_ids, run, split_message, to_mp3, incoming_media, incoming_text
 from telegram_transcribe_bot import OPEN_BOT, on_allow, post_init, resolve_admins, user_filter
-from telegram_transcribe_bot import Endpoint, NO_SOUND, on_error, on_media, on_model, request, transcribe
+from telegram_transcribe_bot import Endpoint, HELP, NO_SOUND, on_error, on_media, on_model, on_text, request, transcribe
 
 
 VOICE = {"voice": Voice(file_id="f", file_unique_id="u", duration=3)}
@@ -276,18 +277,70 @@ class OnMedia(unittest.IsolatedAsyncioTestCase):
         voice.get_file = AsyncMock(return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"a"))))
         return voice
 
-    async def test_a_voice_gets_a_quoted_transcript_and_the_note_is_deleted(self):
+    async def test_a_voice_edits_the_note_into_the_transcript_and_keeps_it(self):
         msg = message(voice=self.voice())
         with patch("telegram_transcribe_bot.transcribe", AsyncMock(return_value="hello")):
             await self.call(msg)
-        msg.reply_text.assert_awaited_with("hello", do_quote=True)
-        msg.reply_text.return_value.delete.assert_awaited_once()
+        msg.reply_text.assert_awaited_once()
+        msg.reply_text.return_value.edit_text.assert_awaited_once_with("hello")
+        msg.reply_text.return_value.delete.assert_not_awaited()
 
-    async def test_no_audio_gets_the_no_sound_reply(self):
+    async def test_no_audio_edits_the_note_to_the_no_sound_text(self):
         msg = message(voice=self.voice())
         with patch("telegram_transcribe_bot.transcribe", AsyncMock(side_effect=NoAudio)):
             await self.call(msg)
-        msg.reply_text.assert_awaited_with(NO_SOUND, do_quote=True)
+        msg.reply_text.return_value.edit_text.assert_awaited_once_with(NO_SOUND)
+
+    async def test_a_long_transcript_edits_the_first_chunk_and_replies_the_rest(self):
+        msg = message(voice=self.voice())
+        with patch("telegram_transcribe_bot.transcribe", AsyncMock(return_value="a" * 4096 + " bb")):
+            await self.call(msg)
+        msg.reply_text.return_value.edit_text.assert_awaited_once_with("a" * 4096)
+        self.assertEqual(msg.reply_text.await_args_list[1].args, ("bb",))
+        self.assertTrue(msg.reply_text.await_args_list[1].kwargs["do_quote"])
+
+    async def test_an_empty_transcript_and_a_failure_edit_the_note(self):
+        for result, expected in ((AsyncMock(return_value=" "), "(no speech found)"), (AsyncMock(side_effect=RuntimeError("boom")), "Transcription failed with m/x:\nboom")):
+            msg = message(voice=self.voice())
+            with patch("telegram_transcribe_bot.transcribe", result):
+                await self.call(msg)
+            msg.reply_text.return_value.edit_text.assert_awaited_once_with(expected)
+
+    async def test_a_failed_note_still_gets_the_transcript_as_a_quoted_reply(self):
+        msg = message(voice=self.voice())
+        msg.reply_text.side_effect = [TelegramError("x"), MagicMock()]
+        with patch("telegram_transcribe_bot.transcribe", AsyncMock(return_value="hello")):
+            await self.call(msg)
+        msg.reply_text.assert_awaited_with("hello", do_quote=True)
+
+    async def test_a_failed_edit_falls_back_to_a_quoted_reply(self):
+        msg = message(voice=self.voice())
+        msg.reply_text.return_value.edit_text = AsyncMock(side_effect=TelegramError("x"))
+        with patch("telegram_transcribe_bot.transcribe", AsyncMock(return_value="hello")):
+            await self.call(msg)
+        msg.reply_text.assert_awaited_with("hello", do_quote=True)
+
+    async def test_notes_are_sent_in_arrival_order_even_when_sends_are_slow_in_reverse(self):
+        sent = []
+        msgs = []
+        for i, delay in enumerate((0.03, 0.02, 0.01)):
+            msg = message(voice=self.voice(), chat_id=4242)
+
+            async def reply(text, do_quote, i=i, delay=delay):
+                await asyncio.sleep(delay)
+                sent.append(i)
+                return MagicMock(edit_text=AsyncMock())
+
+            msg.reply_text = reply
+            msgs.append(msg)
+        with patch("telegram_transcribe_bot.transcribe", AsyncMock(return_value="hello")):
+            await asyncio.gather(*(asyncio.create_task(self.call(m)) for m in msgs))
+        self.assertEqual(sent, [0, 1, 2])
+
+    async def test_plain_text_gets_a_quoted_help(self):
+        msg = message(chat_id=5)
+        await on_text(MagicMock(effective_message=msg), MagicMock())
+        msg.reply_text.assert_awaited_once_with(HELP, do_quote=True)
 
     async def test_a_file_over_20_mb_is_refused_without_downloading(self):
         voice = self.voice(size=21 * 1024 * 1024)
