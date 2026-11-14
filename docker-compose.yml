@@ -6,6 +6,12 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+    # Strangers' messages are logged, so an uncapped log can fill the disk (10 MB x 3 files = 30 MB).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     labels:
       # Auto-update when a watchtower runs with --label-enable on this host.
       - com.centurylinklabs.watchtower.enable=true

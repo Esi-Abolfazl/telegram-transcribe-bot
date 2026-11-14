@@ -45,7 +45,7 @@ You need Docker with Compose, a Telegram account, and an [OpenRouter key](https:
 
 6. Send your bot a voice note.
 
-Logs: `docker compose logs -f bot`. After you edit `.env`, run `docker compose up -d` again: only a
+Logs: `docker compose logs -f bot`, capped at 10 MB × 3 files = 30 MB. After you edit `.env`, run `docker compose up -d` again: only a
 recreated container reads the new values (`docker restart` keeps the old ones).
 
 Only one copy may poll a bot token at a time; a second one fails with `409 Conflict`.
@@ -155,6 +155,11 @@ running image was built from.
   this first; send a long one as an audio file, or trim it.
 - Anything without sound (a photo, sticker, GIF, silent video, PDF or other file) gets a "no
   sound" reply instead of a transcript.
+- An edited message is not transcribed again. Any other text you send gets the help.
+- Up to 4 files are transcribed at once, so answers can arrive out of order; each reply quotes
+  the message it answers.
+- A `data/bot.pickle` that can't be read is moved to `bot.pickle.corrupt` at startup, and the bot
+  starts on the `.env` model.
 - Each file is one transcription request, and OpenRouter's providers time out after 60 s. A
   recording of tens of minutes may fail; splitting it with ffmpeg would lift that.
 - `/model` lists what the endpoint's `/models` returns. OpenRouter and local servers return

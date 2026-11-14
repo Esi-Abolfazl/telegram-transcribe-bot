@@ -6,6 +6,7 @@ import base64
 import html
 import logging
 import os
+import pickle
 import tempfile
 from dataclasses import dataclass
 from functools import partial
@@ -24,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-# Counted by Telegram in UTF-16 units; len() matches for Persian and Latin text, emoji count double.
+# Counted by Telegram in UTF-16 units (emoji count double), so split_message measures in units, not len().
 TELEGRAM_LIMIT = 4096
 # The Bot API refuses getFile above this size.
 DOWNLOAD_LIMIT = 20 * 1024 * 1024
@@ -46,6 +47,8 @@ HELP = (
     "/model reset goes back to the model set in .env."
 )
 
+UNREACHABLE = "Could not reach the endpoint to list its models. The model was not changed."
+
 log = logging.getLogger("telegram_transcribe_bot")
 
 
@@ -62,14 +65,24 @@ class Endpoint:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
 
+def utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
 def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """Split text into Telegram-sized chunks, breaking at the last newline or space."""
+    """Split text into chunks of at most `limit` UTF-16 units, breaking at the last newline or space."""
     chunks = []
     text = text.strip()
-    while len(text) > limit:
-        cut = max(text.rfind("\n", 0, limit + 1), text.rfind(" ", 0, limit + 1))
+    while utf16_units(text) > limit:
+        fit = units = 0
+        for char in text:  # whole characters only, so a surrogate pair is never cut
+            units += 2 if ord(char) > 0xFFFF else 1
+            if units > limit:
+                break
+            fit += 1
+        cut = max(text.rfind("\n", 0, fit + 1), text.rfind(" ", 0, fit + 1))
         if cut <= 0:
-            cut = limit
+            cut = fit
         chunks.append(text[:cut].rstrip())
         text = text[cut:].lstrip()
     if text:
@@ -87,7 +100,13 @@ def incoming_media(allowed_ids: list[int]) -> filters.BaseFilter:
         filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL
         | filters.ANIMATION | filters.PHOTO | filters.Sticker.ALL
     )
-    return media & filters.User(user_id=allowed_ids)
+    # Handlers also match edited_message; an edited caption must not pay for a second transcription.
+    return filters.UpdateType.MESSAGE & media & filters.User(user_id=allowed_ids)
+
+
+def incoming_text(allowed_ids: list[int]) -> filters.BaseFilter:
+    """Plain text (no command) from allowed users: they get the help text."""
+    return filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & filters.User(user_id=allowed_ids)
 
 
 def current_model(bot_data: dict, default: str) -> str:
@@ -223,11 +242,31 @@ async def transcribe(audio: bytes, endpoint: Endpoint, model: str) -> str:
             resp = await request(client, endpoint, model, mp3, timed=False)
     if resp.status_code != 200:
         raise RuntimeError(f"{endpoint.api} {resp.status_code}: {resp.text[:500]}")
-    return lay_out(resp.json())
+    body = resp.json()
+    if isinstance(body, dict) and "error" in body:  # some providers answer 200 with an error body
+        raise RuntimeError(f"{endpoint.api}: {body['error']}"[:500])
+    return lay_out(body)
+
+
+class ModelsUnavailable(Exception):
+    """The models request failed (network error or error status): the endpoint's answer is unknown."""
+
+
+def model_ids(resp: httpx.Response) -> list[str] | None:
+    """Model ids from a /models response; None when it has no usable list, ModelsUnavailable on an error status."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise ModelsUnavailable from exc
+    try:
+        return sorted(m["id"] for m in resp.json()["data"])
+    except (KeyError, TypeError, ValueError):
+        log.warning("no model list in the response from %s", resp.url, exc_info=True)
+        return None
 
 
 async def list_models(endpoint: Endpoint) -> list[str] | None:
-    """Transcription model ids the endpoint offers, or None when it can't say."""
+    """Transcription model ids the endpoint offers, or None when it can't say; raises ModelsUnavailable on a failed request."""
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             # OpenRouter filters by this; OpenAI-compatible servers ignore it.
@@ -236,38 +275,37 @@ async def list_models(endpoint: Endpoint) -> list[str] | None:
                 params={"output_modalities": "transcription"},
                 headers=endpoint.headers(),
             )
-        resp.raise_for_status()
-        return sorted(m["id"] for m in resp.json()["data"])
-    except (httpx.HTTPError, KeyError, TypeError, ValueError):
+    except httpx.HTTPError as exc:
         log.warning("could not list models at %s", endpoint.base_url, exc_info=True)
-        return None
+        raise ModelsUnavailable from exc
+    return model_ids(resp)
 
 
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoint: Endpoint, default_model: str) -> None:
     msg = update.effective_message
     if msg.animation or msg.photo or msg.sticker:
-        await msg.reply_text(NO_SOUND)
+        await msg.reply_text(NO_SOUND, do_quote=True)
         return
     media = msg.voice or msg.audio or msg.video or msg.video_note or msg.document
     if media.file_size and media.file_size > DOWNLOAD_LIMIT:
-        await msg.reply_text("Telegram lets bots download files up to 20 MB only.")
+        await msg.reply_text("Telegram lets bots download files up to 20 MB only.", do_quote=True)
         return
     model = current_model(context.bot_data, default_model)
     # Tells the sender it arrived, so nobody sends the file twice; deleted once the answer is ready.
     # Best effort: a network blip on this note must not cost the transcript.
     working = None
     with contextlib.suppress(TelegramError):
-        working = await msg.reply_text(f"Transcribing with {model}…")
+        working = await msg.reply_text(f"Transcribing with {model}…", do_quote=True)
     try:
         audio = bytes(await (await media.get_file()).download_as_bytearray())
         text = await transcribe(audio, endpoint, model)
     except NoAudio:
-        await msg.reply_text(NO_SOUND)
+        await msg.reply_text(NO_SOUND, do_quote=True)
         return
     except Exception as exc:
         log.exception("transcription failed for message %s", msg.message_id)
         # Only allowed users get here, and the message carries no secret.
-        await msg.reply_text(f"Transcription failed with {model}:\n{exc}"[:TELEGRAM_LIMIT])
+        await msg.reply_text(f"Transcription failed with {model}:\n{exc}"[:TELEGRAM_LIMIT], do_quote=True)
         return
     finally:
         if working:
@@ -275,7 +313,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoi
                 await working.delete()
     chunks = split_message(text) or ["(no speech found)"]
     for chunk in chunks:
-        await msg.reply_text(chunk)
+        await msg.reply_text(chunk, do_quote=True)
     # Length only: transcripts stay out of the logs.
     log.info("message %s: %s via %s -> %d chars in %d reply(s)", msg.message_id, type(media).__name__, model, len(text), len(chunks))
 
@@ -283,9 +321,12 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoi
 async def on_model(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoint: Endpoint, default_model: str) -> None:
     msg = update.effective_message
     if not context.args:
-        card = models_html(
-            current_model(context.bot_data, default_model), "model" not in context.bot_data, await list_models(endpoint)
-        )
+        try:
+            available = await list_models(endpoint)
+        except ModelsUnavailable:
+            await msg.reply_text(UNREACHABLE)
+            return
+        card = models_html(current_model(context.bot_data, default_model), "model" not in context.bot_data, available)
         # python-telegram-bot 22.8 has no send_rich_message yet; this is the raw Bot API call.
         await context.bot.do_api_request(
             "sendRichMessage", api_kwargs={"chat_id": msg.chat_id, "rich_message": {"html": card}}
@@ -297,7 +338,12 @@ async def on_model(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoi
         await context.application.update_persistence()
         await msg.reply_html(f"Back to the .env model: <code>{html.escape(default_model)}</code>")
         return
-    if not accepts_model(requested, await list_models(endpoint)):
+    try:
+        available = await list_models(endpoint)
+    except ModelsUnavailable:
+        await msg.reply_text(UNREACHABLE)
+        return
+    if not accepts_model(requested, available):
         await msg.reply_html(
             f"<code>{html.escape(requested)}</code> is not a transcription model this endpoint offers. /model lists them."
         )
@@ -319,8 +365,28 @@ async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         log.info("ignored a message from user id %s (@%s)", user.id, user.username)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("unhandled error", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        # Fixed text: the exception may carry paths or URLs.
+        with contextlib.suppress(TelegramError):
+            await update.effective_message.reply_text("Something went wrong. The log has the details.")
+
+
 async def set_menu(app: Application) -> None:
     await app.bot.set_my_commands([BotCommand("model", "Show or change the transcription model"), BotCommand("help", "How to use this bot")])
+
+
+def quarantine_corrupt_pickle(path: Path) -> None:
+    """Move an unreadable persistence file aside: PicklePersistence raises on it and the bot would crash-loop."""
+    if not path.exists():
+        return
+    try:
+        pickle.loads(path.read_bytes())
+    except Exception:
+        aside = path.with_name(path.name + ".corrupt")
+        log.warning("%s is unreadable; moved to %s", path, aside, exc_info=True)
+        path.replace(aside)
 
 
 def main() -> None:
@@ -345,9 +411,11 @@ def main() -> None:
 
     data_dir = Path(os.environ.get("DATA_DIR", "data"))
     data_dir.mkdir(parents=True, exist_ok=True)
+    state_file = data_dir / "bot.pickle"
+    quarantine_corrupt_pickle(state_file)
     # bot_data holds only the /model choice; secrets stay in `endpoint`, never on disk.
     persistence = PicklePersistence(
-        data_dir / "bot.pickle",
+        state_file,
         store_data=PersistenceInput(bot_data=True, chat_data=False, user_data=False, callback_data=False),
     )
     app = (
@@ -355,13 +423,16 @@ def main() -> None:
         .token(os.environ["TELEGRAM_BOT_TOKEN"])
         .persistence(persistence)
         .post_init(set_menu)
+        .concurrent_updates(4)  # a slow transcription must not block /model and /help
         .build()
     )
+    app.add_error_handler(on_error)
     is_allowed = filters.User(user_id=allowed)
     config = {"endpoint": endpoint, "default_model": default_model}
     app.add_handler(MessageHandler(incoming_media(allowed), partial(on_media, **config)))
     app.add_handler(CommandHandler("model", partial(on_model, **config), filters=is_allowed))
     app.add_handler(CommandHandler(["start", "help"], on_help, filters=is_allowed))
+    app.add_handler(MessageHandler(incoming_text(allowed), on_help))
     app.add_handler(MessageHandler(~is_allowed, on_stranger))
     log.info("polling; %s at %s; default model %s; %d allowed user(s)", api, endpoint.base_url, default_model, len(allowed))
     # Keep retrying while Telegram is unreachable at startup (a flaky VPN or network) instead of exiting.

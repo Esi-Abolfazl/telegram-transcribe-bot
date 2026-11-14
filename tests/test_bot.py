@@ -1,11 +1,18 @@
+import json
+import pickle
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 from pathlib import Path
 
-from telegram import Animation, Chat, PhotoSize, Sticker, Document, Message, Update, User, Video, VideoNote, Voice
+import httpx
 
-from telegram_transcribe_bot import NoAudio, accepts_model, current_model, lay_out, models_html, parse_allowed_ids, run, split_message, to_mp3, incoming_media
+from telegram.error import TelegramError
+from telegram import Animation, Chat, PhotoSize, Sticker, Document, Message, MessageEntity, Update, User, Video, VideoNote, Voice
+
+from telegram_transcribe_bot import ModelsUnavailable, NoAudio, accepts_model, model_ids, quarantine_corrupt_pickle, utf16_units, current_model, lay_out, models_html, parse_allowed_ids, run, split_message, to_mp3, incoming_media, incoming_text
+from telegram_transcribe_bot import Endpoint, NO_SOUND, on_error, on_media, on_model, request, transcribe
 
 
 VOICE = {"voice": Voice(file_id="f", file_unique_id="u", duration=3)}
@@ -39,7 +46,20 @@ class SplitMessage(unittest.TestCase):
         self.assertEqual(split_message("a" * 10, limit=4), ["aaaa", "aaaa", "aa"])
 
 
+class SplitEmoji(unittest.TestCase):
+    def test_chunks_fit_in_utf16_units_and_rejoin(self):
+        text = "😀" * 5000
+        chunks = split_message(text)
+        self.assertTrue(all(utf16_units(c) <= 4096 for c in chunks))
+        self.assertEqual("".join(chunks), text)
+
+
 class AllowList(unittest.TestCase):
+    def test_edited_message_does_not_pass(self):
+        edited = Update(update_id=1, edited_message=update_from(12).message)
+        self.assertFalse(incoming_media([12]).check_update(edited))
+        self.assertTrue(incoming_media([12]).check_update(update_from(12)))
+
     def test_parses_commas_and_spaces(self):
         self.assertEqual(parse_allowed_ids("12, 34 56"), [12, 34, 56])
         self.assertEqual(parse_allowed_ids(""), [])
@@ -122,6 +142,30 @@ class ModelChoice(unittest.TestCase):
         self.assertTrue(accepts_model("whatever", None))
 
 
+class ModelList(unittest.TestCase):
+    def response(self, status, **kw):
+        return httpx.Response(status, request=httpx.Request("GET", "http://x/models"), **kw)
+
+    def test_error_status_raises_and_bad_body_is_unknown(self):
+        with self.assertRaises(ModelsUnavailable):
+            model_ids(self.response(503))
+        self.assertIsNone(model_ids(self.response(200, json={"models": []})))
+        self.assertEqual(model_ids(self.response(200, json={"data": [{"id": "b"}, {"id": "a"}]})), ["a", "b"])
+
+
+class CorruptPickle(unittest.TestCase):
+    def test_empty_file_moves_aside_and_valid_one_stays(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "bot.pickle")
+            path.write_bytes(b"")
+            quarantine_corrupt_pickle(path)
+            self.assertFalse(path.exists())
+            self.assertTrue(Path(tmp, "bot.pickle.corrupt").exists())
+            path.write_bytes(pickle.dumps({"bot_data": {"model": "a/b"}}))
+            quarantine_corrupt_pickle(path)
+            self.assertTrue(path.exists())
+
+
 class ModelCard(unittest.TestCase):
     def test_groups_by_provider_and_marks_the_one_in_use(self):
         card = models_html("b/x", False, ["a/y", "b/x", "b/z", "base"])
@@ -133,6 +177,147 @@ class ModelCard(unittest.TestCase):
 
     def test_escapes_ids(self):
         self.assertIn("<code>a/&lt;x&gt;</code>", models_html("a/<x>", True, None))
+
+
+OR = Endpoint("openrouter", "http://x/v1", "k")
+OAI = Endpoint("openai", "http://x/v1", "")
+
+
+def mock_client(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class Request(unittest.IsolatedAsyncioTestCase):
+    async def sent(self, endpoint, timed):
+        seen = []
+        async with mock_client(lambda r: seen.append(r) or httpx.Response(200, json={})) as client:
+            await request(client, endpoint, "m/x", b"mp3", timed)
+        return seen[0]
+
+    async def test_openrouter_sends_json_with_deny_and_optional_timings(self):
+        body = json.loads((await self.sent(OR, True)).content)
+        self.assertEqual(body["input_audio"]["format"], "mp3")
+        self.assertEqual(body["provider"]["data_collection"], "deny")
+        self.assertEqual(body["timestamp_granularities"], ["word"])
+        self.assertNotIn("timestamp_granularities", json.loads((await self.sent(OR, False)).content))
+
+    async def test_openai_sends_multipart_with_the_model(self):
+        req = await self.sent(OAI, False)
+        self.assertIn("multipart/form-data", req.headers["content-type"])
+        self.assertIn(b'name="model"', req.content)
+        self.assertIn(b"m/x", req.content)
+
+
+class Transcribe(unittest.IsolatedAsyncioTestCase):
+    async def run_with(self, *responses):
+        calls = []
+
+        def handler(req):
+            calls.append(req)
+            return responses[len(calls) - 1]
+
+        real = httpx.AsyncClient
+        with patch("telegram_transcribe_bot.to_mp3", AsyncMock(return_value=b"mp3")), patch(
+            "telegram_transcribe_bot.httpx.AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler))
+        ):
+            try:
+                return calls, await transcribe(b"a", OR, "m/x")
+            except RuntimeError as exc:
+                return calls, exc
+
+    async def test_a_400_retries_once_without_timings(self):
+        calls, text = await self.run_with(httpx.Response(400), httpx.Response(200, json={"text": "hi"}))
+        self.assertEqual((len(calls), text), (2, "hi"))
+        self.assertNotIn(b"timestamp_granularities", calls[1].content)
+
+    async def test_a_failing_final_status_raises(self):
+        calls, exc = await self.run_with(httpx.Response(400), httpx.Response(500, text="boom"))
+        self.assertEqual(len(calls), 2)
+        self.assertIsInstance(exc, RuntimeError)
+
+    async def test_a_200_error_body_raises_cut_to_500(self):
+        _, exc = await self.run_with(httpx.Response(200, json={"error": "e" * 900}))
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertLessEqual(len(str(exc)), 500)
+        self.assertIn("eee", str(exc))
+
+
+def message(**media):
+    msg = MagicMock(message_id=1, animation=None, photo=(), sticker=None, voice=None, audio=None, video=None,
+                    video_note=None, document=None)
+    for k, v in media.items():
+        setattr(msg, k, v)
+    msg.reply_text = AsyncMock()
+    return msg
+
+
+class OnMedia(unittest.IsolatedAsyncioTestCase):
+    async def call(self, msg):
+        update = MagicMock(effective_message=msg)
+        await on_media(update, MagicMock(bot_data={}), endpoint=OR, default_model="m/x")
+
+    def voice(self, size=10):
+        voice = MagicMock(file_size=size)
+        voice.get_file = AsyncMock(return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"a"))))
+        return voice
+
+    async def test_a_voice_gets_a_quoted_transcript_and_the_note_is_deleted(self):
+        msg = message(voice=self.voice())
+        with patch("telegram_transcribe_bot.transcribe", AsyncMock(return_value="hello")):
+            await self.call(msg)
+        msg.reply_text.assert_awaited_with("hello", do_quote=True)
+        msg.reply_text.return_value.delete.assert_awaited_once()
+
+    async def test_no_audio_gets_the_no_sound_reply(self):
+        msg = message(voice=self.voice())
+        with patch("telegram_transcribe_bot.transcribe", AsyncMock(side_effect=NoAudio)):
+            await self.call(msg)
+        msg.reply_text.assert_awaited_with(NO_SOUND, do_quote=True)
+
+    async def test_a_file_over_20_mb_is_refused_without_downloading(self):
+        voice = self.voice(size=21 * 1024 * 1024)
+        msg = message(voice=voice)
+        await self.call(msg)
+        voice.get_file.assert_not_awaited()
+        self.assertIn("20 MB", msg.reply_text.await_args.args[0])
+
+
+class OnModel(unittest.IsolatedAsyncioTestCase):
+    async def call(self, listing):
+        msg = MagicMock(reply_html=AsyncMock(), reply_text=AsyncMock())
+        context = MagicMock(args=["a/b"], bot_data={}, application=MagicMock(update_persistence=AsyncMock()))
+        with patch("telegram_transcribe_bot.list_models", listing):
+            await on_model(MagicMock(effective_message=msg), context, endpoint=OR, default_model="m/x")
+        return context.bot_data
+
+    async def test_a_listed_id_is_saved(self):
+        self.assertEqual(await self.call(AsyncMock(return_value=["a/b"])), {"model": "a/b"})
+
+    async def test_an_unlisted_id_is_refused(self):
+        self.assertEqual(await self.call(AsyncMock(return_value=["c/d"])), {})
+
+    async def test_an_unreachable_endpoint_saves_nothing(self):
+        self.assertEqual(await self.call(AsyncMock(side_effect=ModelsUnavailable)), {})
+
+
+class PlainText(unittest.TestCase):
+    def test_only_an_allowed_users_plain_text_passes(self):
+        f = incoming_text([12])
+        self.assertTrue(f.check_update(update_from(12, {})))
+        self.assertFalse(f.check_update(update_from(99, {})))
+        command = update_from(12, {"text": "/model", "entities": (MessageEntity(MessageEntity.BOT_COMMAND, 0, 6),)})
+        self.assertFalse(f.check_update(command))
+
+
+class ErrorHandler(unittest.IsolatedAsyncioTestCase):
+    async def test_replies_with_fixed_text_and_survives_no_update(self):
+        update = MagicMock(spec=Update, effective_message=MagicMock(reply_text=AsyncMock()))
+        context = MagicMock(error=RuntimeError("secret"))
+        await on_error(update, context)
+        self.assertNotIn("secret", update.effective_message.reply_text.await_args.args[0])
+        update.effective_message.reply_text.side_effect = TelegramError("x")
+        await on_error(update, context)
+        await on_error(None, context)
 
 
 if __name__ == "__main__":
