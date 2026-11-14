@@ -12,6 +12,7 @@ from telegram.error import TelegramError
 from telegram import Animation, Chat, PhotoSize, Sticker, Document, Message, MessageEntity, Update, User, Video, VideoNote, Voice
 
 from telegram_transcribe_bot import ModelsUnavailable, NoAudio, accepts_model, model_ids, quarantine_corrupt_pickle, utf16_units, current_model, lay_out, models_html, parse_allowed_ids, run, split_message, to_mp3, incoming_media, incoming_text
+from telegram_transcribe_bot import OPEN_BOT, on_allow, post_init, resolve_admins, user_filter
 from telegram_transcribe_bot import Endpoint, NO_SOUND, on_error, on_media, on_model, request, transcribe
 
 
@@ -92,6 +93,20 @@ class AllowList(unittest.TestCase):
 
     def test_empty_list_lets_nobody_through(self):
         self.assertFalse(incoming_media([]).check_update(update_from(12)))
+
+    def test_star_means_everyone(self):
+        self.assertIsNone(parse_allowed_ids("*"))
+        self.assertIsNone(parse_allowed_ids(" * "))
+
+    def test_everyone_passes_with_none_but_not_with_a_list(self):
+        self.assertTrue(incoming_media(None).check_update(update_from(99)))
+        self.assertTrue(incoming_text(None).check_update(update_from(99, {})))
+        self.assertFalse(incoming_media([12]).check_update(update_from(99)))
+
+    def test_admins_resolve_from_the_explicit_list_then_the_allowed_ids(self):
+        self.assertEqual(resolve_admins("5", [12]), [5])
+        self.assertEqual(resolve_admins("", [12]), [12])
+        self.assertEqual(resolve_admins("", None), [])
 
 
 class SilentMedia(unittest.IsolatedAsyncioTestCase):
@@ -298,6 +313,56 @@ class OnModel(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unreachable_endpoint_saves_nothing(self):
         self.assertEqual(await self.call(AsyncMock(side_effect=ModelsUnavailable)), {})
+
+
+class ManageAccess(unittest.IsolatedAsyncioTestCase):
+    async def call(self, args, *, allow=True, env_ids=(12,), admins=(5,), added=None, flt=None):
+        msg = MagicMock(reply_text=AsyncMock())
+        bot_data = {} if added is None else {"allowed": added}
+        context = MagicMock(args=args, bot_data=bot_data, application=MagicMock(update_persistence=AsyncMock()))
+        flt = flt or user_filter([*(env_ids or ()), *admins])
+        await on_allow(
+            MagicMock(effective_message=msg), context, allow=allow, flt=flt, env_ids=None if env_ids is None else list(env_ids), admins=list(admins)
+        )
+        return bot_data, msg.reply_text.await_args.args[0], flt
+
+    async def test_allow_adds_once(self):
+        data, reply, flt = await self.call(["77"])
+        self.assertEqual((data["allowed"], reply), ([77], "Allowed: 77"))
+        data, _, _ = await self.call(["77"], added=[77], flt=flt)
+        self.assertEqual(data["allowed"], [77])
+
+    async def test_allow_rejects_a_non_integer_and_a_negative(self):
+        for arg in ("abc", "-3", "0", "1.5"):
+            data, reply, _ = await self.call([arg])
+            self.assertEqual(data, {})
+            self.assertTrue(reply.startswith("Usage:"))
+
+    async def test_deny_removes_an_added_id(self):
+        data, reply, _ = await self.call(["77"], allow=False, added=[77, 8])
+        self.assertEqual((data["allowed"], reply), ([8], "Denied: 77"))
+
+    async def test_deny_refuses_env_and_admin_ids_and_reports_unknown(self):
+        for uid, text in ((12, "12 is set in .env and stays allowed."), (5, "5 is set in .env and stays allowed."), (9, "9 was not in the list.")):
+            data, reply, flt = await self.call([str(uid)], allow=False, added=[77])
+            self.assertEqual((data["allowed"], reply), ([77], text))
+        self.assertTrue(incoming_media(flt).check_update(update_from(12)))
+
+    async def test_the_shared_filter_follows_allow_and_deny(self):
+        _, _, flt = await self.call(["77"])
+        self.assertTrue(incoming_media(flt).check_update(update_from(77)))
+        await self.call(["77"], allow=False, added=[77], flt=flt)
+        self.assertFalse(incoming_media(flt).check_update(update_from(77)))
+
+    async def test_everyone_mode_changes_nothing(self):
+        data, reply, _ = await self.call(["77"], env_ids=None)
+        self.assertEqual((data, reply), ({}, OPEN_BOT))
+
+    async def test_saved_ids_are_restored_at_startup(self):
+        flt = user_filter([12])
+        app = MagicMock(bot_data={"allowed": [77]}, bot=MagicMock(set_my_commands=AsyncMock()))
+        await post_init(app, flt=flt)
+        self.assertTrue(incoming_media(flt).check_update(update_from(77)))
 
 
 class PlainText(unittest.TestCase):

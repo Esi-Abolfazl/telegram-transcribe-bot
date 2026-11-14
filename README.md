@@ -10,9 +10,12 @@ Whisper); past Telegram's 4096-character limit it arrives as several messages.
   Transcribe, Gemini...), any OpenAI-compatible API, or a local Whisper on your own machine.
 - **Switch from Telegram.** `/model` lists the models your endpoint offers, `/model <id>` switches,
   `/model reset` goes back to the one in `.env`. The choice survives restarts.
-- **Private by default.** Only Telegram user ids in `ALLOWED_USER_IDS` get an answer; anyone else
-  is ignored and their id is logged. On OpenRouter, requests ask for providers that don't keep
-  your audio (`data_collection: deny`). Logs hold user ids and transcript lengths, never text.
+- **Manage access from Telegram.** Admins add and remove users with `/allow <id>` and `/deny <id>`,
+  no `.env` edit or restart.
+- **Private by default.** Only the ids in `ALLOWED_USER_IDS`, the admins and the users an admin
+  allowed get an answer; anyone else is ignored and their id is logged. `ALLOWED_USER_IDS=*` opens
+  the bot to everyone. On OpenRouter, requests ask for providers that don't keep your audio
+  (`data_collection: deny`). Logs hold user ids and transcript lengths, never text.
 - Long polling, no webhook, no open port: it runs anywhere Docker runs, a laptop included.
 
 ## Quick start (Docker)
@@ -57,14 +60,15 @@ All settings live in `.env` ([`.env.example`](.env.example) explains each).
 | Variable | Default | What it does |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | required | From @BotFather |
-| `ALLOWED_USER_IDS` | empty (nobody) | Who gets answers, comma separated |
+| `ALLOWED_USER_IDS` | empty (nobody) | Who gets answers, comma separated; `*` means everyone |
+| `ADMIN_USER_IDS` | empty (the allowed ids) | Who may run `/model`, `/allow`, `/deny` and `/users`, comma separated; `*` is refused. With `ALLOWED_USER_IDS=*` and this empty, nobody is admin |
 | `TRANSCRIBE_API` | `openrouter` | `openrouter` (JSON API) or `openai` (OpenAI multipart API, local servers) |
 | `TRANSCRIBE_BASE_URL` | `https://openrouter.ai/api/v1` | The API root; `/audio/transcriptions` is appended |
 | `TRANSCRIBE_API_KEY` | empty | Required for OpenRouter; empty for a local server without auth |
 | `TRANSCRIBE_MODEL` | `elevenlabs/scribe-v2` | The default model; `/model` overrides it |
-| `DATA_DIR` | `data` | Where the `/model` choice is saved |
+| `DATA_DIR` | `data` | Where the `/model` choice and the ids added with `/allow` are saved |
 
-Every allowed user may run `/model`, and the choice applies to everyone on that bot.
+Only admins may run `/model`, `/allow`, `/deny` and `/users` (other allowed users get a short refusal), and the model choice applies to everyone on that bot. Admins are always allowed.
 
 ## Changing the model
 
@@ -76,6 +80,17 @@ From Telegram:
 
 From `.env`: set `TRANSCRIBE_MODEL`, then `docker compose up -d`. A `/model` choice still wins
 until `/model reset`.
+
+## Managing access
+
+Admins only:
+
+- `/allow <id>` lets a user in. `/deny <id>` removes one added that way.
+- `/users` lists the admins, the ids from `.env` and the ids added from Telegram.
+
+The added ids are saved in `DATA_DIR` and survive restarts. Ids in `ALLOWED_USER_IDS` and admins
+cannot be denied from Telegram; edit `.env` for those. With `ALLOWED_USER_IDS=*` the commands change
+nothing. A user's id comes from @userinfobot, or from the bot's log (it logs everyone it ignores).
 
 ### Which model
 
@@ -151,6 +166,7 @@ running image was built from.
 
 ## Limits
 
+- An open bot (`ALLOWED_USER_IDS=*`) lets anyone spend your transcription key: set a spending limit on the key.
 - The Bot API lets a bot download files up to 20 MB; bigger files get a short refusal. Videos hit
   this first; send a long one as an audio file, or trim it.
 - Anything without sound (a photo, sticker, GIF, silent video, PDF or other file) gets a "no

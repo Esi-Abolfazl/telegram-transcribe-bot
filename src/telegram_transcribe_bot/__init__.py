@@ -42,10 +42,13 @@ NO_SOUND = "This has no sound to transcribe. Send a voice note, audio or a video
 HELP = (
     "Send me a voice note, an audio file, a video or a round video, forwarded or not, and I reply with "
     "its transcript. Telegram lets bots download up to 20 MB.\n\n"
-    "/model shows the transcription model and the ones you can pick.\n"
-    "/model <id> switches to another model.\n"
-    "/model reset goes back to the model set in .env."
+    "/model shows the transcription model and the ones you can pick (admins only).\n"
+    "/model <id> switches to another model (admins only).\n"
+    "/model reset goes back to the model set in .env (admins only).\n"
+    "/allow <id>, /deny <id> and /users manage who may use the bot (admins only)."
 )
+NOT_ADMIN = "Only an admin can do that."
+OPEN_BOT = "The bot is open to everyone, so the list is not used."
 
 UNREACHABLE = "Could not reach the endpoint to list its models. The model was not changed."
 
@@ -90,23 +93,56 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     return chunks
 
 
-def parse_allowed_ids(raw: str) -> list[int]:
+def parse_allowed_ids(raw: str) -> list[int] | None:
+    """The id list, or None for "*" (everyone)."""
+    if raw.strip() == "*":
+        return None
     return [int(part) for part in raw.replace(",", " ").split()]
 
 
-def incoming_media(allowed_ids: list[int]) -> filters.BaseFilter:
+def resolve_admins(admin_raw: str, allowed: list[int] | None) -> list[int]:
+    """Who may run /model: ADMIN_USER_IDS when set, else the allowed ids (nobody when everyone is allowed)."""
+    return parse_allowed_ids(admin_raw) or allowed or []
+
+
+def user_filter(ids: list[int] | filters.BaseFilter | None) -> filters.BaseFilter:
+    """The one place that decides who may use the bot: None means everyone. A filter passes through, so one shared object can be mutated at runtime."""
+    if isinstance(ids, filters.BaseFilter):
+        return ids
+    return filters.ALL if ids is None else filters.User(user_id=ids)
+
+
+def parse_user_id(args: list[str]) -> int | None:
+    """The one positive integer id in a command's arguments, else None."""
+    if len(args) == 1 and args[0].isascii() and args[0].isdigit() and int(args[0]) > 0:
+        return int(args[0])
+    return None
+
+
+def change_allowed(added: list[int], protected: set[int], user_id: int, add: bool) -> tuple[list[int], str]:
+    """The new Telegram-added list and the reply for /allow (add) or /deny."""
+    if add:
+        return (added if user_id in added else [*added, user_id]), f"Allowed: {user_id}"
+    if user_id in protected:
+        return added, f"{user_id} is set in .env and stays allowed."
+    if user_id not in added:
+        return added, f"{user_id} was not in the list."
+    return [i for i in added if i != user_id], f"Denied: {user_id}"
+
+
+def incoming_media(allowed_ids: list[int] | filters.BaseFilter | None) -> filters.BaseFilter:
     """Every file or media message from allowed users: anything without sound still gets an answer."""
     media = (
         filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL
         | filters.ANIMATION | filters.PHOTO | filters.Sticker.ALL
     )
     # Handlers also match edited_message; an edited caption must not pay for a second transcription.
-    return filters.UpdateType.MESSAGE & media & filters.User(user_id=allowed_ids)
+    return filters.UpdateType.MESSAGE & media & user_filter(allowed_ids)
 
 
-def incoming_text(allowed_ids: list[int]) -> filters.BaseFilter:
+def incoming_text(allowed_ids: list[int] | filters.BaseFilter | None) -> filters.BaseFilter:
     """Plain text (no command) from allowed users: they get the help text."""
-    return filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & filters.User(user_id=allowed_ids)
+    return filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & user_filter(allowed_ids)
 
 
 def current_model(bot_data: dict, default: str) -> str:
@@ -315,7 +351,10 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoi
     for chunk in chunks:
         await msg.reply_text(chunk, do_quote=True)
     # Length only: transcripts stay out of the logs.
-    log.info("message %s: %s via %s -> %d chars in %d reply(s)", msg.message_id, type(media).__name__, model, len(text), len(chunks))
+    log.info(
+        "message %s from user %s: %s via %s -> %d chars in %d reply(s)",
+        msg.message_id, update.effective_user.id, type(media).__name__, model, len(text), len(chunks),
+    )
 
 
 async def on_model(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoint: Endpoint, default_model: str) -> None:
@@ -355,8 +394,45 @@ async def on_model(update: Update, context: ContextTypes.DEFAULT_TYPE, *, endpoi
     await msg.reply_html(f"Model: <code>{html.escape(requested)}</code>. Send a voice to try it.")
 
 
+async def on_allow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, allow: bool, flt: filters.BaseFilter, env_ids: list[int] | None, admins: list[int]
+) -> None:
+    msg = update.effective_message
+    if env_ids is None:
+        await msg.reply_text(OPEN_BOT)
+        return
+    user_id = parse_user_id(context.args)
+    if user_id is None:
+        await msg.reply_text(f"Usage: /{'allow' if allow else 'deny'} <user id> (a positive number).")
+        return
+    protected = {*env_ids, *admins}
+    added, reply = change_allowed(context.bot_data.get("allowed", []), protected, user_id, allow)
+    context.bot_data["allowed"] = added
+    if allow:
+        flt.add_user_ids(user_id)
+    elif user_id not in protected:
+        flt.remove_user_ids(user_id)
+    await context.application.update_persistence()
+    log.info("%s %s by user %s", "allow" if allow else "deny", user_id, update.effective_user.id)
+    await msg.reply_text(reply)
+
+
+async def on_users(update: Update, context: ContextTypes.DEFAULT_TYPE, *, env_ids: list[int] | None, admins: list[int]) -> None:
+    def show(ids) -> str:
+        return ", ".join(map(str, ids)) or "none"
+
+    await update.effective_message.reply_text(
+        f"Admins: {show(admins)}\n.env: {'everyone' if env_ids is None else show(env_ids)}\n"
+        f"Added from Telegram: {show(context.bot_data.get('allowed', []))}"
+    )
+
+
 async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(HELP)
+
+
+async def on_not_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(NOT_ADMIN)
 
 
 async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -375,6 +451,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def set_menu(app: Application) -> None:
     await app.bot.set_my_commands([BotCommand("model", "Show or change the transcription model"), BotCommand("help", "How to use this bot")])
+
+
+async def post_init(app: Application, *, flt: filters.BaseFilter) -> None:
+    await set_menu(app)
+    # Everyone-mode uses filters.ALL, which has no id list to restore.
+    if isinstance(flt, filters.User):
+        flt.add_user_ids(app.bot_data.get("allowed", []))
 
 
 def quarantine_corrupt_pickle(path: Path) -> None:
@@ -406,34 +489,46 @@ def main() -> None:
         raise SystemExit("TRANSCRIBE_API_KEY is empty, and OpenRouter needs one (https://openrouter.ai/keys)")
     default_model = os.environ.get("TRANSCRIBE_MODEL") or DEFAULT_MODEL
     allowed = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
-    if not allowed:
+    if allowed == []:
         log.warning("ALLOWED_USER_IDS is empty: the bot answers nobody; send it a message to log your id")
+    admin_raw = os.environ.get("ADMIN_USER_IDS", "")
+    if admin_raw.strip() == "*":
+        raise SystemExit("ADMIN_USER_IDS must be a list of user ids; * is only for ALLOWED_USER_IDS")
+    admins = resolve_admins(admin_raw, allowed)
 
     data_dir = Path(os.environ.get("DATA_DIR", "data"))
     data_dir.mkdir(parents=True, exist_ok=True)
     state_file = data_dir / "bot.pickle"
     quarantine_corrupt_pickle(state_file)
-    # bot_data holds only the /model choice; secrets stay in `endpoint`, never on disk.
+    # bot_data holds only the /model choice and the ids added with /allow; secrets stay in `endpoint`, never on disk.
     persistence = PicklePersistence(
         state_file,
         store_data=PersistenceInput(bot_data=True, chat_data=False, user_data=False, callback_data=False),
     )
+    shared = user_filter(None if allowed is None else [*allowed, *admins])
     app = (
         Application.builder()
         .token(os.environ["TELEGRAM_BOT_TOKEN"])
         .persistence(persistence)
-        .post_init(set_menu)
+        .post_init(partial(post_init, flt=shared))
         .concurrent_updates(4)  # a slow transcription must not block /model and /help
         .build()
     )
     app.add_error_handler(on_error)
-    is_allowed = filters.User(user_id=allowed)
     config = {"endpoint": endpoint, "default_model": default_model}
-    app.add_handler(MessageHandler(incoming_media(allowed), partial(on_media, **config)))
-    app.add_handler(CommandHandler("model", partial(on_model, **config), filters=is_allowed))
-    app.add_handler(CommandHandler(["start", "help"], on_help, filters=is_allowed))
-    app.add_handler(MessageHandler(incoming_text(allowed), on_help))
-    app.add_handler(MessageHandler(~is_allowed, on_stranger))
-    log.info("polling; %s at %s; default model %s; %d allowed user(s)", api, endpoint.base_url, default_model, len(allowed))
+    admin_only = filters.User(user_id=admins)
+    app.add_handler(MessageHandler(incoming_media(shared), partial(on_media, **config)))
+    app.add_handler(CommandHandler("model", partial(on_model, **config), filters=admin_only))
+    for name, allow in (("allow", True), ("deny", False)):
+        app.add_handler(CommandHandler(name, partial(on_allow, allow=allow, flt=shared, env_ids=allowed, admins=admins), filters=admin_only))
+    app.add_handler(CommandHandler("users", partial(on_users, env_ids=allowed, admins=admins), filters=admin_only))
+    app.add_handler(CommandHandler(["model", "allow", "deny", "users"], on_not_admin, filters=shared))
+    app.add_handler(CommandHandler(["start", "help"], on_help, filters=shared))
+    app.add_handler(MessageHandler(incoming_text(shared), on_help))
+    app.add_handler(MessageHandler(~shared, on_stranger))
+    log.info(
+        "polling; %s at %s; default model %s; %s allowed; %d admin(s)",
+        api, endpoint.base_url, default_model, "everyone" if allowed is None else f"{len(allowed)} user(s)", len(admins),
+    )
     # Keep retrying while Telegram is unreachable at startup (a flaky VPN or network) instead of exiting.
     app.run_polling(bootstrap_retries=-1)
